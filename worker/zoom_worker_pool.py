@@ -522,11 +522,32 @@ SCREEN_SHARE_SURVIVAL_INIT_SCRIPT = r"""
 
     function defangPc(pc) {
       try {
-        // Mute every existing receiver's video track immediately.
+        // (a) Mute every existing receiver's video track immediately.
         if (pc.getReceivers) {
           pc.getReceivers().forEach((r) => defangVideoTrack(r.track));
         }
-        // Mute every existing sender's video track AND zero its bitrate.
+        // (b) v8.6.3 — flip every existing VIDEO transceiver to direction='inactive'.
+        //     This is what truly stops Zoom's SFU from sending video packets at
+        //     all — including the screen-share stream that lights up Chromium's
+        //     H.264/VP8 decoder and causes the CPU spike → soft-kick cascade.
+        //     `track.enabled = false` alone only stops RENDERING; the decode
+        //     pipeline still runs. Setting direction='inactive' makes the SFU
+        //     stop transmitting → zero decode work → bot stays in meeting.
+        if (pc.getTransceivers) {
+          pc.getTransceivers().forEach((t) => {
+            try {
+              const isVideo =
+                (t.receiver && t.receiver.track && t.receiver.track.kind === 'video') ||
+                (t.sender && t.sender.track && t.sender.track.kind === 'video') ||
+                // mid hint (Zoom often labels these "video_*" or "1"/"2")
+                (typeof t.mid === 'string' && /vid|video/i.test(t.mid));
+              if (isVideo && t.direction !== 'inactive') {
+                t.direction = 'inactive';
+              }
+            } catch (e) {}
+          });
+        }
+        // (c) Mute every existing sender's video track AND zero its bitrate.
         if (pc.getSenders) {
           pc.getSenders().forEach((s) => {
             try {
@@ -609,6 +630,67 @@ SCREEN_SHARE_SURVIVAL_INIT_SCRIPT = r"""
         for (const pc of window.__zk_pcs) defangPc(pc);
       } catch (e) {}
     }, 1000);
+
+    // v8.6.3 — FAST sweep: every 200ms, only call defangPc on PCs whose
+    // signaling state recently changed. This catches the brief window
+    // between Zoom's "ScreenShare started" SDP renegotiation and our 1s sweep
+    // — the exact window in which Chromium's decoder briefly spikes CPU and
+    // Zoom soft-kicks the bot.
+    setInterval(() => {
+      try {
+        for (const pc of window.__zk_pcs) {
+          try {
+            // cheap proxy for "renegotiation in flight": signaling != stable
+            if (pc.signalingState && pc.signalingState !== 'stable') {
+              defangPc(pc);
+            }
+          } catch (e) {}
+        }
+      } catch (e) {}
+    }, 200);
+
+    // v8.6.3 — Hook setLocalDescription so we ALSO flip video transceivers
+    // to inactive RIGHT BEFORE the SDP answer is sent to Zoom's SFU.
+    // This is the deterministic point at which the SFU learns whether to
+    // send us video at all. Combined with the patch in defangPc, this
+    // guarantees the SFU never gets a "recv video" answer from us.
+    try {
+      const Orig3 = window.RTCPeerConnection;
+      if (Orig3 && Orig3.prototype && !Orig3.prototype.__zk_sld_patched) {
+        const origSLD2 = Orig3.prototype.setLocalDescription;
+        Orig3.prototype.setLocalDescription = function (desc) {
+          try { defangPc(this); } catch (e) {}
+          return origSLD2.apply(this, arguments);
+        };
+        Orig3.prototype.__zk_sld_patched = true;
+      }
+    } catch (e) {}
+
+    // v8.6.3 — Hook setRemoteDescription to flip transceivers to 'inactive'
+    // RIGHT AFTER Zoom's offer arrives but BEFORE createAnswer reads the
+    // transceiver state. This makes the bot's outgoing answer SDP advertise
+    // "no video receive", causing the SFU to stop transmitting video
+    // (incl. screen share) at the protocol level — zero decode CPU.
+    try {
+      const Orig4 = window.RTCPeerConnection;
+      if (Orig4 && Orig4.prototype && !Orig4.prototype.__zk_srd_dir_patched) {
+        const origSRD2 = Orig4.prototype.setRemoteDescription;
+        Orig4.prototype.setRemoteDescription = function (desc) {
+          const self = this;
+          const ret = origSRD2.apply(self, arguments);
+          // After SRD resolves, all transceivers exist — flip video ones.
+          try {
+            if (ret && typeof ret.then === 'function') {
+              ret.then(() => {
+                try { defangPc(self); } catch (e) {}
+              }, () => {});
+            }
+          } catch (e) {}
+          return ret;
+        };
+        Orig4.prototype.__zk_srd_dir_patched = true;
+      }
+    } catch (e) {}
 
     // Defensive: hide ALL existing + future <video> / <canvas> elements via CSS
     // so even if a frame slips through, the renderer never paints it.
@@ -2866,7 +2948,7 @@ async def main():
                 pass
 
     s = _machine_specs()
-    log.info(f"Zoom Worker v8.6.2 (asyncio socket-spam silenced + STRICT admin cap) starting")
+    log.info(f"Zoom Worker v8.6.3 (screen-share survival HARDENED + asyncio silence) starting")
     log.info(f"  dashboard={DASHBOARD_URL}")
     log.info(f"  cpu={s['cpu_count']}c  ram={s['total_ram_gb']:.1f}G  "
              f"safe_cap={_compute_safe_capacity(s)}")
