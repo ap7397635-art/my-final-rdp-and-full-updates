@@ -2561,6 +2561,61 @@ async def task_poller():
 
 
 _poller_task: Optional[asyncio.Task] = None
+_daily_reset_task: Optional[asyncio.Task] = None
+
+
+# v8.6.5 — Daily reset (IST midnight). At 00:00 India Standard Time every
+# day the following are zeroed:
+#   • per-user `usage` counter (the "Usage X / 15000" indicator)
+#   • completed/failed/cancelled tasks (the task-history list)
+# Active + scheduled tasks are left untouched so an in-flight meeting at the
+# stroke of midnight survives.
+IST_TZ = timezone(timedelta(hours=5, minutes=30))
+
+
+def _seconds_until_next_ist_midnight() -> float:
+    now_ist = datetime.now(IST_TZ)
+    tomorrow_ist = (now_ist + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return max(1.0, (tomorrow_ist - now_ist).total_seconds())
+
+
+async def daily_reset_loop():
+    """Sleeps until the next IST midnight, then resets usage + history."""
+    # On boot, wait for the next IST midnight (don't fire immediately on start).
+    while True:
+        try:
+            secs = _seconds_until_next_ist_midnight()
+            log.info(
+                "daily-reset: next run in %.1fh (at IST 00:00)", secs / 3600.0
+            )
+            await asyncio.sleep(secs)
+
+            # Reset every user's usage counter
+            r_users = await db.users.update_many({}, {"$set": {"usage": 0}})
+            # Wipe finished/cancelled task history (keep active + scheduled)
+            r_tasks = await db.tasks.delete_many(
+                {"status": {"$in": ["completed", "failed", "cancelled"]}}
+            )
+            # Cascade: drop chunks that referenced the deleted tasks
+            r_chunks = await db.task_chunks.delete_many(
+                {"status": {"$in": ["completed", "failed", "cancelled"]}}
+            )
+            log.info(
+                "daily-reset (IST midnight): usage cleared for %d users, "
+                "purged %d task(s) + %d chunk(s)",
+                r_users.modified_count, r_tasks.deleted_count, r_chunks.deleted_count,
+            )
+            # Tiny grace sleep so we don't accidentally re-fire if the clock
+            # is exactly on the boundary.
+            await asyncio.sleep(2)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.exception("daily-reset error: %s", e)
+            # Backoff before retrying so a transient failure doesn't busy-loop.
+            await asyncio.sleep(60)
 
 
 @app.on_event("startup")
@@ -2575,15 +2630,18 @@ async def on_startup():
             log.info("Cleared %s stale login lockouts on startup", res.deleted_count)
     except Exception as e:
         log.warning("login_attempts cleanup skipped: %s", e)
-    global _poller_task
+    global _poller_task, _daily_reset_task
     _poller_task = asyncio.create_task(task_poller())
+    _daily_reset_task = asyncio.create_task(daily_reset_loop())
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    global _poller_task
+    global _poller_task, _daily_reset_task
     if _poller_task:
         _poller_task.cancel()
+    if _daily_reset_task:
+        _daily_reset_task.cancel()
     client.close()
 
 
