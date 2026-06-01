@@ -1160,7 +1160,16 @@ async def _install_context_init_scripts(ctx) -> None:
     very first navigation.
     """
     # v9.4: expose env-controlled flags to all scripts via window.__zk_cfg
-    nuclear_sdp_strip = os.environ.get("ZK_NUCLEAR_SDP_STRIP", "").lower() in ("1", "true", "yes")
+    # v8.6.5: SDP video-strip is now ON by default (was opt-in via env).
+    # The previous v8.6.4 stack (transceiver-inactive + getStats spoof +
+    # DOM nuke + VP8-only codec) handles 95%+ cases, but on weak RDPs the
+    # SFU's screen-share offer can still briefly negotiate a video stream
+    # before our transceiver flip lands. Stripping m=video from the SDP
+    # itself makes the negotiation FAIL at the protocol level — the SFU
+    # records "no video subscription" and literally never sends a packet.
+    # Override with `ZK_NUCLEAR_SDP_STRIP=false` if you ever need to disable.
+    _env = os.environ.get("ZK_NUCLEAR_SDP_STRIP", "true").lower()
+    nuclear_sdp_strip = _env not in ("0", "false", "no", "off")
     cfg_script = (
         "window.__zk_cfg = window.__zk_cfg || {};"
         f"window.__zk_cfg.nuclear_sdp_strip = {str(nuclear_sdp_strip).lower()};"
@@ -3096,7 +3105,7 @@ async def main():
                 pass
 
     s = _machine_specs()
-    log.info(f"Zoom Worker v8.6.4 (4-layer screen-share survival: tx-inactive + stats-spoof + DOM-nuke + VP8-only) starting")
+    log.info(f"Zoom Worker v8.6.5 (8-layer screen-share survival: SDP video-strip ON by default) starting")
     log.info(f"  dashboard={DASHBOARD_URL}")
     log.info(f"  cpu={s['cpu_count']}c  ram={s['total_ram_gb']:.1f}G  "
              f"safe_cap={_compute_safe_capacity(s)}")

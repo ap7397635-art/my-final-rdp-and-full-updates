@@ -175,6 +175,13 @@ CLEANUP_INTERVAL_SEC=300
 
 # Optional: local names file (overrides dashboard Name source if set)
 LOCAL_NAMES_FILE=
+
+# ---- v8.6.5: nuclear SDP video-strip (screen-share survival, layer 8) ----
+# Removes m=video sections from incoming/outgoing SDP so Zoom's SFU never
+# sends video packets at all (incl. screen share) — zero decode CPU even
+# on cheap RDPs. Set to "false" only if joining ever fails on a Zoom build
+# that rejects video-less SDP.
+ZK_NUCLEAR_SDP_STRIP=true
 "@
 [IO.File]::WriteAllText("$WorkerDir\.env", $envText, [Text.UTF8Encoding]::new($false))
 Write-Host "  .env saved with v8.3.2 prewarm defaults" -ForegroundColor Green
