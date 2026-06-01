@@ -1,0 +1,36 @@
+{
+  "summary": "Backend regression run after v9.1 worker-side screen-share fix in /app/worker/zoom_worker_pool.py. Verified that the dashboard backend APIs (auth, workers admin + self, task lifecycle, validate-credentials) are fully intact. Worker file parses cleanly (ast.parse OK). 15/15 pytest cases passed against the public REACT_APP_BACKEND_URL.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_backend_regression.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Worker-side fix (Playwright add_init_script ordering + suppression of track.stop on remote receiver tracks) cannot be validated here — must be tested on an RDP against a real Zoom meeting with screen share. Recommend the user verify on real RDP that bots stay in the meeting when host starts screen share."
+  ],
+  "critical_code_review_comments": [
+    "/app/backend/server.py is ~2500 lines — strongly recommend splitting into routers (auth.py, tasks.py, workers.py, name_files.py) for maintainability.",
+    "_get_online_worker_count uses an in-process cache dict that is mutated without a lock; under high concurrency in a single uvicorn worker it's fine, but document the assumption (multiple uvicorn workers each keep their own cache; cluster-wide truth comes from redis).",
+    "POST /workers returns response_model=WorkerCreatedOut but the 'token' field is only set on the dict (out['token']) — verified working, but consider returning the Pydantic model directly for type safety.",
+    "validate_zoom_credentials accepts payload: dict — switch to a Pydantic model so FastAPI auto-validates and documents the body schema.",
+    "Task /api/tasks/{id}/progress aggregates joined_count across chunks every call (find_one_and_update + aggregate + update_one). With 30+ workers reporting every few seconds this is 3 DB ops per progress event. Consider denormalising the chunk-side counter to a single $inc on the parent doc."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_backend_regression.py (new)"
+  ],
+  "success_rate": {"backend": "100%", "frontend": "skipped (per request)"},
+  "test_credentials": "admin@finalzoom.com / Admin@FinalZoom2026 (seeded automatically on backend startup)",
+  "seed_data_creation": "Test created one ephemeral worker (TestRDP1-<random>) and one task (meeting_id=1234567890, members=5). Both cleaned up in TestCleanup at the end of the run.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend regression suite lives at /app/backend/tests/test_backend_regression.py. It is self-contained — creates its own worker and task, runs the full lifecycle (login → create worker → heartbeat → create task → claim → progress → complete), and cleans up after itself. Run with: pytest /app/backend/tests/test_backend_regression.py -v. Worker file at /app/worker/zoom_worker_pool.py was syntax-checked only (ast.parse) — functional validation requires a real Zoom + Playwright RDP environment.",
+  "rca_of_the_issue": "Worker-side screen-share drop fix (NOT exercised here): root cause was Playwright add_init_script being installed AFTER page.goto, so the WebRTC video-track guard never executed for the page session that loaded Zoom client. Additionally, track.stop() was being called on remote receiver tracks which Zoom interprets as 'participant left' and removes the bot from the meeting. Documented in /app/memory/PRD.md v9.1. RCA done by main agent; this run only confirms no dashboard API regressed."
+}
