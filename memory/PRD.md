@@ -14,6 +14,11 @@
    - Other RDPs cannot see or claim that task (server filter enforces it).
 2. **RDP IP address column** on Workers page — captured automatically from
    the heartbeat request (X-Forwarded-For / X-Real-IP / direct). Click-to-copy.
+3. **Bulk Send Task** button — select N RDPs, send the SAME meeting to all
+   of them in one click. Two modes:
+   - Auto-split: enter total bots, split evenly across selected RDPs.
+   - Same per RDP: every selected RDP gets the same member count.
+   Each chosen RDP gets its OWN force-assigned task in parallel.
 3. **Backend changes** in `/app/backend/server.py`:
    - `WorkerOut.public_ip` (new field)
    - `worker_heartbeat` now captures client IP from request headers
@@ -46,6 +51,5 @@
 - `TaskCreate.restricted_workers` — array of worker IDs allowed to claim
 
 ## Backlog / next ideas
-- Bulk send: pick N RDPs, send the same meeting to all of them in one shot
-  (with per-RDP member split)
 - Surface RDP geo-location next to the IP (country flag from IP geo)
+- "Resend last task" per RDP — 1-tap repeat of the last meeting

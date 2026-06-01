@@ -45,6 +45,9 @@ export default function WorkersPage() {
   const [bulkTotalBots, setBulkTotalBots] = useState(1000);
   // v8.6: per-RDP "Send Task" modal — force-assigns a task to a single RDP.
   const [sendTarget, setSendTarget] = useState(null);
+  // v8.6.1: bulk send — select N RDPs, send the SAME meeting to all of them.
+  // Each chosen RDP gets its own force-assigned task (so they run in parallel).
+  const [showBulkSend, setShowBulkSend] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -289,6 +292,15 @@ SPAWN_DELAY_MS=400
               disabled={workers.length === 0}
             >
               <Layers size={14} /> Bulk Set Capacity
+            </button>
+            <button
+              onClick={() => setShowBulkSend(true)}
+              className="zs-btn zs-btn-primary"
+              data-testid="bulk-send-task-button"
+              title="Send the SAME meeting to multiple RDPs in one click (force-assigned)"
+              disabled={workers.length === 0}
+            >
+              <Send size={14} /> Bulk Send Task
             </button>
             <button
               onClick={() => setShowAdd(true)}
@@ -861,6 +873,14 @@ SPAWN_DELAY_MS=400
           onSent={() => { setSendTarget(null); load(); }}
         />
       )}
+
+      {showBulkSend && (
+        <BulkSendTaskModal
+          workers={workers}
+          onClose={() => setShowBulkSend(false)}
+          onSent={() => { setShowBulkSend(false); load(); }}
+        />
+      )}
     </div>
   );
 }
@@ -1283,3 +1303,447 @@ function SendTaskModal({ worker, onClose, onSent }) {
     </div>
   );
 }
+
+// ===========================================================================
+// BulkSendTaskModal — send the SAME meeting to multiple RDPs in one click.
+// Each selected RDP gets ITS OWN force-assigned task (restricted_workers).
+// Two modes:
+//   - "fixed": every selected RDP gets the SAME `perRdpMembers` value.
+//   - "auto":  user enters total bots, we split evenly across selected RDPs.
+// ===========================================================================
+function BulkSendTaskModal({ workers, onClose, onSent }) {
+  const [meetingId, setMeetingId] = useState(() => {
+    try { return localStorage.getItem("zs.meetingId") || ""; } catch { return ""; }
+  });
+  const [password, setPassword] = useState(() => {
+    try { return localStorage.getItem("zs.meetingPwd") || ""; } catch { return ""; }
+  });
+  const [meetingType, setMeetingType] = useState("Normal Participants");
+  const [timeoutSec, setTimeoutSec] = useState(7200);
+  const [nameSource, setNameSource] = useState("NamesIn");
+  const [floating, setFloating] = useState(false);
+  const [reactions, setReactions] = useState(false);
+  const [splitMode, setSplitMode] = useState("auto"); // "auto" | "fixed"
+  const [totalBots, setTotalBots] = useState(100);
+  const [perRdpMembers, setPerRdpMembers] = useState(10);
+  // Pre-select all online RDPs by default
+  const [selected, setSelected] = useState(() => {
+    const s = new Set();
+    workers.forEach((w) => { if (w.status === "online") s.add(w.id); });
+    return s;
+  });
+  const [busy, setBusy] = useState(false);
+  const [nameOptions, setNameOptions] = useState([
+    { id: "NamesIn", name: "NamesIn" },
+    { id: "Indian", name: "Indian" },
+    { id: "English", name: "English" },
+  ]);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const [b, f] = await Promise.all([
+          api.get("/name-files/builtin"),
+          api.get("/name-files"),
+        ]);
+        setNameOptions([
+          ...b.data,
+          ...f.data.map((x) => ({ id: x.name, name: x.name, builtin: false })),
+        ]);
+      } catch {}
+    })();
+  }, []);
+
+  useEffect(() => {
+    try { localStorage.setItem("zs.meetingId", meetingId); } catch {}
+  }, [meetingId]);
+  useEffect(() => {
+    try { localStorage.setItem("zs.meetingPwd", password); } catch {}
+  }, [password]);
+
+  const toggleOne = (id) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+  const toggleAll = () => {
+    setSelected((prev) =>
+      prev.size === workers.length ? new Set() : new Set(workers.map((w) => w.id))
+    );
+  };
+  const selectOnlineOnly = () => {
+    const s = new Set();
+    workers.forEach((w) => { if (w.status === "online") s.add(w.id); });
+    setSelected(s);
+  };
+
+  // Build per-worker allocation plan based on the selected mode.
+  const buildPlan = () => {
+    const targets = workers
+      .filter((w) => selected.has(w.id))
+      .slice()
+      .sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+    if (targets.length === 0) return [];
+    if (splitMode === "fixed") {
+      const n = Math.max(1, parseInt(perRdpMembers, 10) || 1);
+      return targets.map((w) => ({ worker: w, members: n }));
+    }
+    // auto: split totalBots evenly. First R RDPs get base+1.
+    const total = Math.max(1, parseInt(totalBots, 10) || 1);
+    const base = Math.floor(total / targets.length);
+    const remainder = total - base * targets.length;
+    return targets.map((w, i) => ({
+      worker: w,
+      members: Math.max(1, base + (i < remainder ? 1 : 0)),
+    }));
+  };
+
+  const plan = buildPlan();
+  const totalAllocated = plan.reduce((s, p) => s + p.members, 0);
+
+  const submit = async (e) => {
+    e?.preventDefault?.();
+    if (selected.size === 0) return toast.error("Select at least one RDP");
+    const cleaned = meetingId.replace(/\D/g, "");
+    if (!cleaned) return toast.error("Wrong Meeting ID: cannot be empty");
+    if (cleaned.length < 9 || cleaned.length > 11)
+      return toast.error(`Wrong Meeting ID: must be 9-11 digits (got ${cleaned.length})`);
+    if (password) {
+      if (password.length > 10) return toast.error("Wrong Password: max 10 chars");
+      if (!/^[A-Za-z0-9]+$/.test(password))
+        return toast.error("Wrong Password: only letters & digits");
+    }
+    if (plan.length === 0) return toast.error("Nothing to send");
+    if (plan.some((p) => p.members < 1)) return toast.error("Each RDP must get >= 1 member");
+
+    setBusy(true);
+    try {
+      const results = await Promise.allSettled(
+        plan.map(({ worker, members }) =>
+          api.post(`/workers/${worker.id}/send-task`, {
+            meeting_id: cleaned,
+            meeting_password: password,
+            members,
+            name_source: nameSource,
+            meeting_type: meetingType,
+            timeout: parseInt(timeoutSec, 10) || 7200,
+            floating_emoji: floating,
+            participant_reactions: reactions,
+            reaction_interval_min: 30,
+            reaction_interval_max: 90,
+            distribution_mode: "greedy",
+          })
+        )
+      );
+      const ok = results.filter((r) => r.status === "fulfilled").length;
+      const fail = results.length - ok;
+      if (fail === 0) {
+        toast.success(`Sent ${totalAllocated} bots across ${ok} RDP${ok === 1 ? "" : "s"}`);
+      } else {
+        toast.warning(`Sent to ${ok}/${results.length} RDPs (${fail} failed)`);
+      }
+      onSent?.();
+    } catch (e) {
+      toast.error(formatApiErrorDetail(e.response?.data?.detail) || "Bulk send failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+      onClick={onClose}
+      data-testid="bulk-send-task-modal"
+    >
+      <form
+        onSubmit={submit}
+        className="zs-card-2 p-6 w-full max-w-3xl max-h-[90vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-3">
+            <div className="section-icon icon-indigo"><Send size={16} /></div>
+            <div>
+              <h3 className="text-white font-bold text-lg">Bulk Send Task</h3>
+              <div className="text-white/50 text-xs">
+                Same meeting → multiple RDPs (each gets its own force-assigned task)
+              </div>
+            </div>
+          </div>
+          <button type="button" onClick={onClose} className="text-white/60 hover:text-white" aria-label="Close">
+            <X size={18} />
+          </button>
+        </div>
+
+        {/* Meeting details */}
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <div className="zs-label">Meeting ID</div>
+            <input
+              className="zs-input"
+              placeholder="9-11 digits"
+              value={meetingId}
+              onChange={(e) => setMeetingId(e.target.value)}
+              data-testid="bulk-meeting-id"
+              autoFocus
+            />
+          </div>
+          <div>
+            <div className="zs-label">Password</div>
+            <input
+              className="zs-input"
+              placeholder="Optional"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              data-testid="bulk-meeting-pwd"
+            />
+          </div>
+          <div>
+            <div className="zs-label">Name Pool</div>
+            <select
+              className="zs-input"
+              value={nameSource}
+              onChange={(e) => setNameSource(e.target.value)}
+              data-testid="bulk-name-source"
+            >
+              {nameOptions.map((o) => (
+                <option key={o.id} value={o.id}>{o.name}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <div className="zs-label">Meeting Type</div>
+            <select
+              className="zs-input"
+              value={meetingType}
+              onChange={(e) => setMeetingType(e.target.value)}
+              data-testid="bulk-meeting-type"
+            >
+              <option>Normal Participants</option>
+              <option>Co-Host Participants</option>
+              <option>Webinar Attendees</option>
+            </select>
+          </div>
+          <div>
+            <div className="zs-label">Timeout (sec)</div>
+            <input
+              className="zs-input"
+              type="number"
+              min="10"
+              max="86400"
+              value={timeoutSec}
+              onChange={(e) => setTimeoutSec(e.target.value)}
+              data-testid="bulk-timeout"
+            />
+          </div>
+          <div className="flex gap-3 items-end">
+            <label className="flex-1 flex items-center justify-between zs-card p-2 cursor-pointer text-xs">
+              <span className="text-white/90">Floating Emoji</span>
+              <input
+                type="checkbox"
+                checked={floating}
+                onChange={(e) => setFloating(e.target.checked)}
+                className="w-4 h-4 accent-indigo-500"
+                data-testid="bulk-floating-toggle"
+              />
+            </label>
+            <label className="flex-1 flex items-center justify-between zs-card p-2 cursor-pointer text-xs">
+              <span className="text-white/90">Reactions</span>
+              <input
+                type="checkbox"
+                checked={reactions}
+                onChange={(e) => setReactions(e.target.checked)}
+                className="w-4 h-4 accent-indigo-500"
+                data-testid="bulk-reactions-toggle"
+              />
+            </label>
+          </div>
+        </div>
+
+        {/* Split mode */}
+        <div className="mt-5 zs-card p-3" data-testid="bulk-split-mode-card">
+          <div className="flex items-center gap-4 mb-2 flex-wrap">
+            <span className="text-white/80 text-sm font-semibold">Distribution:</span>
+            <label className="inline-flex items-center gap-2 text-white/90 text-sm cursor-pointer">
+              <input
+                type="radio"
+                name="splitMode"
+                checked={splitMode === "auto"}
+                onChange={() => setSplitMode("auto")}
+                className="accent-indigo-500"
+                data-testid="bulk-mode-auto"
+              />
+              Auto-split total
+            </label>
+            <label className="inline-flex items-center gap-2 text-white/90 text-sm cursor-pointer">
+              <input
+                type="radio"
+                name="splitMode"
+                checked={splitMode === "fixed"}
+                onChange={() => setSplitMode("fixed")}
+                className="accent-indigo-500"
+                data-testid="bulk-mode-fixed"
+              />
+              Same per RDP
+            </label>
+          </div>
+          {splitMode === "auto" ? (
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <div className="zs-label">Total Bots (split evenly)</div>
+                <input
+                  className="zs-input"
+                  type="number"
+                  min="1"
+                  max="100000"
+                  value={totalBots}
+                  onChange={(e) => setTotalBots(e.target.value)}
+                  data-testid="bulk-total-bots"
+                />
+              </div>
+              <div className="text-xs text-white/60 self-end pb-2">
+                {selected.size > 0 ? (
+                  <>
+                    {totalBots} ÷ {selected.size} = <b className="text-emerald-300">{Math.floor((parseInt(totalBots, 10) || 0) / selected.size)}</b>
+                    {((parseInt(totalBots, 10) || 0) % selected.size) > 0
+                      ? ` (+1 on first ${(parseInt(totalBots, 10) || 0) % selected.size})` : ""}
+                  </>
+                ) : "Select RDPs below"}
+              </div>
+            </div>
+          ) : (
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <div className="zs-label">Members per RDP</div>
+                <input
+                  className="zs-input"
+                  type="number"
+                  min="1"
+                  max="800"
+                  value={perRdpMembers}
+                  onChange={(e) => setPerRdpMembers(e.target.value)}
+                  data-testid="bulk-per-rdp-members"
+                />
+              </div>
+              <div className="text-xs text-white/60 self-end pb-2">
+                Total: <b className="text-emerald-300">{(parseInt(perRdpMembers, 10) || 0) * selected.size}</b> bots across {selected.size} RDP{selected.size === 1 ? "" : "s"}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* RDP selection list */}
+        <div className="mt-5">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-white/80 text-sm font-semibold">
+              Select RDPs ({selected.size}/{workers.length})
+            </div>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={selectOnlineOnly}
+                className="text-xs text-emerald-300 hover:text-emerald-200"
+                data-testid="bulk-select-online"
+              >
+                Online only
+              </button>
+              <span className="text-white/30">·</span>
+              <button
+                type="button"
+                onClick={toggleAll}
+                className="text-xs text-indigo-300 hover:text-indigo-200"
+                data-testid="bulk-toggle-all"
+              >
+                {selected.size === workers.length ? "Deselect all" : "Select all"}
+              </button>
+            </div>
+          </div>
+          <div className="zs-table-wrap !max-h-[260px]" data-testid="bulk-rdp-list">
+            <table className="zs-table text-xs">
+              <thead>
+                <tr>
+                  <th className="w-8"></th>
+                  <th>RDP</th>
+                  <th>Status</th>
+                  <th>IP</th>
+                  <th>Cap / Load</th>
+                  <th>Will send</th>
+                </tr>
+              </thead>
+              <tbody>
+                {workers.slice().sort((a, b) => (a.name || "").localeCompare(b.name || "")).map((w) => {
+                  const isSel = selected.has(w.id);
+                  const allocation = plan.find((p) => p.worker.id === w.id)?.members ?? 0;
+                  const exceeds = allocation > w.capacity_max;
+                  return (
+                    <tr key={w.id} data-testid={`bulk-row-${w.id}`}>
+                      <td>
+                        <input
+                          type="checkbox"
+                          checked={isSel}
+                          onChange={() => toggleOne(w.id)}
+                          className="w-4 h-4 accent-indigo-500"
+                          data-testid={`bulk-check-${w.id}`}
+                        />
+                      </td>
+                      <td className="font-semibold text-white">{w.name}</td>
+                      <td>
+                        <span className={`text-[10px] font-bold ${w.status === "online" ? "text-emerald-400" : "text-amber-400"}`}>
+                          {w.status}
+                        </span>
+                      </td>
+                      <td className="font-mono text-[10px] text-cyan-300">{w.public_ip || "—"}</td>
+                      <td className="font-mono text-[10px] text-white/70">{w.capacity_max} / {w.current_load}</td>
+                      <td>
+                        {isSel ? (
+                          <span className={`font-mono font-bold ${exceeds ? "text-rose-400" : "text-emerald-300"}`}>
+                            {allocation}{exceeds ? " ⚠" : ""}
+                          </span>
+                        ) : (
+                          <span className="text-white/30">—</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div className="text-xs text-white/60 mt-2">
+            Total: <b className="text-emerald-300" data-testid="bulk-total-allocated">{totalAllocated}</b> bots
+            {plan.some((p) => p.members > p.worker.capacity_max) && (
+              <span className="text-amber-300 ml-2">⚠ some allocations exceed RDP capacity</span>
+            )}
+          </div>
+        </div>
+
+        <div className="flex gap-3 mt-5">
+          <button
+            type="submit"
+            disabled={busy || selected.size === 0}
+            className="zs-btn zs-btn-primary flex-1"
+            data-testid="bulk-send-submit"
+          >
+            {busy ? <span className="zs-spin" /> : (
+              <>
+                <Send size={14} /> Force-send {totalAllocated} bots → {selected.size} RDP{selected.size === 1 ? "" : "s"}
+              </>
+            )}
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            className="zs-btn zs-btn-ghost"
+            data-testid="bulk-send-cancel"
+          >
+            Cancel
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
