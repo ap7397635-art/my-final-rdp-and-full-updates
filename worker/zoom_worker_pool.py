@@ -1137,6 +1137,34 @@ logging.basicConfig(
 )
 log = logging.getLogger("zoom-worker-v8")
 
+# v8.6.2 — Suppress asyncio's "socket.send() raised exception" warning flood.
+# These fire HUNDREDS of times per second when Playwright closes a browser/
+# context (CDP socket dies mid-write). They drown out real errors and have
+# no functional impact — the underlying asyncio code already handles the
+# disconnect, the WARNING is purely informational.
+class _AsyncioSocketSendFilter(logging.Filter):
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        # Drop the specific noisy line + the conn-lost variant
+        if "socket.send() raised exception" in msg:
+            return False
+        if "Fatal write error on socket transport" in msg:
+            return False
+        return True
+
+
+for _n in ("asyncio", "asyncio.selector_events", "asyncio.proactor_events"):
+    _lg = logging.getLogger(_n)
+    _lg.addFilter(_AsyncioSocketSendFilter())
+    # Also bump level so any leftover INFO/DEBUG chatter is silenced
+    if _lg.level == logging.NOTSET or _lg.level < logging.ERROR:
+        _lg.setLevel(logging.ERROR)
+# Root logger also gets the filter (catches handlers configured elsewhere)
+logging.getLogger().addFilter(_AsyncioSocketSendFilter())
+
 # ---------------------------------------------------------------- chromium args
 # Ultra-optimized flag set straight from the architecture doc + extra RAM saves.
 CHROMIUM_ARGS = [
@@ -2838,7 +2866,7 @@ async def main():
                 pass
 
     s = _machine_specs()
-    log.info(f"Zoom Worker v8.3.6 (STRICT admin cap + muted-join + no-camera-perm) starting")
+    log.info(f"Zoom Worker v8.6.2 (asyncio socket-spam silenced + STRICT admin cap) starting")
     log.info(f"  dashboard={DASHBOARD_URL}")
     log.info(f"  cpu={s['cpu_count']}c  ram={s['total_ram_gb']:.1f}G  "
              f"safe_cap={_compute_safe_capacity(s)}")
