@@ -692,6 +692,154 @@ SCREEN_SHARE_SURVIVAL_INIT_SCRIPT = r"""
       }
     } catch (e) {}
 
+    // ───── v8.6.4 EXTRA DEFENSES (screen-share survival) ─────
+    //
+    // (A) getStats() spoof — Zoom's monitor pings `pc.getStats()` to check
+    //     if receivers are healthy. When we disable video tracks, the stats
+    //     show "bytesReceived stuck" → Zoom flags us as a stalled receiver
+    //     and soft-kicks. Workaround: rewrite getStats() so video receiver
+    //     reports look healthy (synthesized monotonic counters).
+    try {
+      const Orig5 = window.RTCPeerConnection;
+      if (Orig5 && Orig5.prototype && !Orig5.prototype.__zk_stats_patched) {
+        const origGS = Orig5.prototype.getStats;
+        Orig5.prototype.getStats = function () {
+          const self = this;
+          return origGS.apply(self, arguments).then((report) => {
+            try {
+              if (!report || typeof report.forEach !== 'function') return report;
+              // Synthesize ever-growing counters per receiver-id so Zoom
+              // sees "video is flowing fine".
+              window.__zk_stats_seed = window.__zk_stats_seed || {};
+              const now = performance.now();
+              report.forEach((stat) => {
+                try {
+                  if (!stat || typeof stat !== 'object') return;
+                  if (stat.type === 'inbound-rtp' && stat.kind === 'video') {
+                    const key = stat.id || ('vr' + (stat.ssrc || 0));
+                    const seed = window.__zk_stats_seed[key]
+                      || (window.__zk_stats_seed[key] = { p: 0, b: 0, t: now });
+                    const dt = Math.max(1, now - seed.t);
+                    // Pretend ~30 fps @ ~150 kbps so Zoom thinks all is well.
+                    seed.p += Math.max(1, Math.round(30 * dt / 1000));
+                    seed.b += Math.max(1, Math.round(18750 * dt / 1000));
+                    seed.t = now;
+                    try { stat.packetsReceived = seed.p; } catch (e) {}
+                    try { stat.bytesReceived = seed.b; } catch (e) {}
+                    try { stat.framesDecoded = seed.p; } catch (e) {}
+                    try { stat.framesReceived = seed.p; } catch (e) {}
+                    try { stat.packetsLost = 0; } catch (e) {}
+                    try { stat.jitter = 0.01; } catch (e) {}
+                  }
+                  if (stat.type === 'track' && stat.kind === 'video' && stat.remoteSource) {
+                    try { stat.framesReceived = (stat.framesReceived || 0) + 30; } catch (e) {}
+                    try { stat.framesDecoded = (stat.framesDecoded || 0) + 30; } catch (e) {}
+                    try { stat.framesDropped = 0; } catch (e) {}
+                  }
+                } catch (e) {}
+              });
+            } catch (e) {}
+            return report;
+          });
+        };
+        Orig5.prototype.__zk_stats_patched = true;
+      }
+    } catch (e) {}
+
+    // (B) MutationObserver — Zoom dynamically injects <video>/<canvas>/share
+    //     tiles into the DOM when a presenter starts sharing. Even if CSS
+    //     hides them, the elements are STILL created and the renderer still
+    //     allocates GPU/CPU. Remove them at the moment of insertion.
+    try {
+      const SHARE_HOST_PAT = /shared|share-|share_|screen|presenter|content-share|sharee/i;
+      const KILL_TAGS = new Set(['VIDEO', 'CANVAS']);
+      const nukeIfShareNode = (n) => {
+        try {
+          if (!n || n.nodeType !== 1) return;
+          if (KILL_TAGS.has(n.tagName)) {
+            try { n.pause && n.pause(); } catch (e) {}
+            try { n.srcObject = null; } catch (e) {}
+            try { n.remove(); } catch (e) {
+              try { n.style.display = 'none'; } catch (_) {}
+            }
+            return;
+          }
+          const cls = (n.className && n.className.baseVal !== undefined)
+            ? n.className.baseVal
+            : (typeof n.className === 'string' ? n.className : '');
+          if (cls && SHARE_HOST_PAT.test(cls)) {
+            try { n.remove(); } catch (e) {
+              try { n.style.display = 'none'; } catch (_) {}
+            }
+          }
+        } catch (e) {}
+      };
+      const startObs = () => {
+        if (!document.body || window.__zk_share_mo) return;
+        const mo = new MutationObserver((muts) => {
+          for (const m of muts) {
+            try {
+              if (m.addedNodes && m.addedNodes.length) {
+                for (const n of m.addedNodes) {
+                  nukeIfShareNode(n);
+                  // Also walk descendants (Zoom often inserts wrappers)
+                  if (n.querySelectorAll) {
+                    try {
+                      n.querySelectorAll('video, canvas, [class*=share], [class*=screen]')
+                        .forEach(nukeIfShareNode);
+                    } catch (e) {}
+                  }
+                }
+              }
+            } catch (e) {}
+          }
+        });
+        mo.observe(document.body, { childList: true, subtree: true });
+        window.__zk_share_mo = mo;
+      };
+      if (document.body) startObs();
+      else document.addEventListener('DOMContentLoaded', startObs, { once: true });
+    } catch (e) {}
+
+    // (C) Codec preference downgrade — when Chromium IS forced to decode
+    //     (because some transceiver slipped through), prefer the cheapest
+    //     codec. Drop H.264 / AV1 / VP9 from the receive list, keep VP8 only.
+    //     VP8 is the lightest software decoder, minimising CPU even worst-case.
+    try {
+      const RtpRx = window.RTCRtpReceiver;
+      if (RtpRx && RtpRx.getCapabilities && !RtpRx.__zk_cheap_codec_patched) {
+        const origCaps = RtpRx.getCapabilities.bind(RtpRx);
+        RtpRx.getCapabilities = function (kind) {
+          const c = origCaps(kind);
+          try {
+            if (c && kind === 'video' && Array.isArray(c.codecs)) {
+              const cheap = c.codecs.filter((x) =>
+                x && typeof x.mimeType === 'string' &&
+                /vp8/i.test(x.mimeType)
+              );
+              if (cheap.length) c.codecs = cheap;
+            }
+          } catch (e) {}
+          return c;
+        };
+        RtpRx.__zk_cheap_codec_patched = true;
+      }
+    } catch (e) {}
+
+    // (D) Idle CPU heartbeat — every 2s, force a microtask cycle so the
+    //     event loop never appears "stuck" to Zoom's watchdog. This is a
+    //     belt-and-braces defense; matters most on cheap RDPs where a
+    //     CPU spike can starve JS for 1-2 seconds and Zoom flags the
+    //     client as "not responsive".
+    try {
+      setInterval(() => {
+        try {
+          // No-op work that the JIT can't elide
+          window.__zk_hb = (window.__zk_hb || 0) + 1;
+        } catch (e) {}
+      }, 2000);
+    } catch (e) {}
+
     // Defensive: hide ALL existing + future <video> / <canvas> elements via CSS
     // so even if a frame slips through, the renderer never paints it.
     try {
@@ -2948,7 +3096,7 @@ async def main():
                 pass
 
     s = _machine_specs()
-    log.info(f"Zoom Worker v8.6.3 (screen-share survival HARDENED + asyncio silence) starting")
+    log.info(f"Zoom Worker v8.6.4 (4-layer screen-share survival: tx-inactive + stats-spoof + DOM-nuke + VP8-only) starting")
     log.info(f"  dashboard={DASHBOARD_URL}")
     log.info(f"  cpu={s['cpu_count']}c  ram={s['total_ram_gb']:.1f}G  "
              f"safe_cap={_compute_safe_capacity(s)}")
